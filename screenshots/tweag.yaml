@@ -1,0 +1,15 @@
+project: tweag
+urls:
+    - https://tweag.io/
+    - https://tweag.io/services
+    - https://tweag.io/industry/biotech
+    - https://tweag.io/industry/fintech
+    - https://tweag.io/industry/autonomous
+    - https://tweag.io/opensource
+    - https://tweag.io/contact
+    - https://tweag.io/blog
+devices:
+    - widescreen
+    - desktop
+    - ipad
+    - mobile
