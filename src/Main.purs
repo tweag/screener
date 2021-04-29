@@ -19,7 +19,7 @@ import Node.FS.Aff (readTextFile)
 import Node.FS.Aff.Mkdirp (mkdirp)
 import Pathy (Dir, File, Path, Rel, unsafePrintPath, currentDir, dir, parseRelDir, parseRelFile, posixParser, posixPrinter, sandboxAny, (<.>), (</>))
 import Screener.Devices as D
-import Options.Applicative (execParser, str, argument, ParserInfo, Parser, (<**>), info, strOption, long, metavar, help, fullDesc, progDesc, header, helper)
+import Options.Applicative (execParser, str, argument, ParserInfo, Parser, (<**>), info, metavar, fullDesc, progDesc, header, helper)
 import Toppokki as T
 
 type Config
@@ -31,47 +31,48 @@ type Config
 type CaptureConfig
   = { project :: String
     , device :: String
-    , viewport :: Either String (Record T.DefaultViewPort)
-    , folder :: Either String (Path Rel Dir)
-    , fname :: Either String (Path Rel File)
     , url :: T.URL
     }
 
-prepareCapture :: Config -> String -> T.URL -> CaptureConfig
-prepareCapture config device url =
-  { project: config.project
-  , folder:
-      case projectDir, deviceDir of
-        Left err, _ -> Left $ err
-        _, Left err -> Left $ err
-        Right a, Right b -> Right $ currentDir </> screenDir </> a </> b
-  , fname:
-      case fname of
-        Left err -> Left $ err
-        Right x -> Right $ x <.> "png"
-  , viewport:
-      case D.getDevice device of
-        Just d -> Right d
-        Nothing -> Left $ "Can't find device: " <> device
-  , device: device
-  , url: url
-  }
+getFolder :: String -> String -> Either String (Path Rel Dir)
+getFolder project device = case projectDir, deviceDir of
+  Left err, _ -> Left $ err
+  _, Left err -> Left $ err
+  Right a, Right b -> Right $ currentDir </> screenDir </> a </> b
   where
-  screenDir = dir (SProxy :: SProxy "screenshots")
-
   deviceDir = case parseDir device of
     Just x -> Right x
     Nothing -> Left $ "Can't parse device " <> device <> "\n"
 
-  projectDir = case parseDir config.project of
+  projectDir = case parseDir project of
     Just x -> Right x
-    Nothing -> Left $ "Can't parse project " <> config.project <> "\n"
+    Nothing -> Left $ "Can't parse project " <> project <> "\n"
 
+  screenDir = dir (SProxy :: SProxy "screenshots")
+
+getFname :: T.URL -> Either String (Path Rel File)
+getFname url = case fname of
+  Left err -> Left $ err
+  Right x -> Right $ x <.> "png"
+  where
   fname = case parseRelFile posixParser (url2fname url) of
     Just x -> Right x
     Nothing -> Left $ "Can't parse url " <> showURL url <> "\n"
 
-  parseDir dir = parseRelDir posixParser ("./" <> dir <> "/")
+getViewport :: String -> Either String (Record T.DefaultViewPort)
+getViewport device = case D.getDevice device of
+  Just d -> Right d
+  Nothing -> Left $ "Can't find device: " <> device
+
+prepareCapture :: Config -> String -> T.URL -> CaptureConfig
+prepareCapture config device url =
+  { project: config.project
+  , device: device
+  , url: url
+  }
+
+parseDir :: String -> Maybe (Path Rel Dir)
+parseDir dir = parseRelDir posixParser ("./" <> dir <> "/")
 
 readConfig :: String -> Aff (Either String Config)
 readConfig fpath = do
@@ -97,47 +98,54 @@ url2fname (T.URL x) = (noSlash >>> noColon >>> noDot) x
   noDot = replaceAll (Pattern ".") (Replacement "_")
 
 capture :: T.Page -> CaptureConfig -> Aff Unit
-capture page config = case config of
-  { viewport: Left err } -> log err
-  { folder: Left err } -> log err
-  { fname: Left err } -> log err
-  { viewport: Right viewport, folder: Right folder, fname: Right fname } -> do
+capture page config = case folderE, fnameE, viewportE of
+  Right folder, Right fname, Right viewport -> do
     (mkdirp $ getPathD folder) >>= log
     T.goto config.url page
     T.setViewport viewport page
     delay $ Milliseconds 1000.0
     _ <- T.screenshot { path: getPathF (folder </> fname), fullPage: true } page
-    log $ "screenshots for " <> showURL config.url <> " and " <> config.device <> " taken"
-    where
-    getPathF :: Path Rel File -> String
-    getPathF = sandboxAny >>> unsafePrintPath posixPrinter
+    log $ "screenshot taken for " <> showURL config.url <> " and " <> config.device
+  Left err, _, _ -> log err
+  _, Left err, _ -> log err
+  _, _, Left err -> log err
+  where
+  folderE = getFolder config.project config.device
 
-    getPathD :: Path Rel Dir -> String
-    getPathD = sandboxAny >>> unsafePrintPath posixPrinter
+  fnameE = getFname config.url
 
+  viewportE = getViewport config.device
+
+  getPathF :: Path Rel File -> String
+  getPathF = sandboxAny >>> unsafePrintPath posixPrinter
+
+  getPathD :: Path Rel Dir -> String
+  getPathD = sandboxAny >>> unsafePrintPath posixPrinter
 
 cli :: ParserInfo String
-cli = info (options <**> helper) $ fold
-         [fullDesc,
-           progDesc "Take screenshots of websites for many devices",
-           header "Screener - take screenshots of websites"]
-    where
-    options :: Parser String
-    options = argument str (metavar "PROJECTCONFIG")
-
+cli =
+  info (options <**> helper)
+    $ fold
+        [ fullDesc
+        , progDesc "Take screenshots of websites for many devices"
+        , header "Screener - take screenshots of websites"
+        ]
+  where
+  options :: Parser String
+  options = argument str (metavar "PROJECTCONFIG")
 
 main :: Effect Unit
 main = do
-        projectFile <- execParser cli
-        launchAff_ do
-          log "🍝"
-          readConfig projectFile
-            >>= case _ of
-                Left err -> log err
-                Right config -> do
-                  browser <- T.launch { executablePath: "chromium" }
-                  page <- T.newPage browser
-                  let
-                    cfgs = prepareCapture config <$> config.devices <*> (T.URL <$> config.urls)
-                  sequence_ (capture page <$> cfgs)
-                  T.close browser
+  projectFile <- execParser cli
+  launchAff_ do
+    log "🍝"
+    readConfig projectFile
+      >>= case _ of
+          Left err -> log err
+          Right config -> do
+            browser <- T.launch { executablePath: "chromium" }
+            page <- T.newPage browser
+            let
+              cfgs = prepareCapture config <$> config.devices <*> (T.URL <$> config.urls)
+            sequence_ (capture page <$> cfgs)
+            T.close browser
