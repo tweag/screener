@@ -8,12 +8,14 @@ You can edit this file as you like.
   , "argonaut"
   , "console"
   , "effect"
+  , "mmorph"
   , "node-fs-aff"
   , "open-mkdirp-aff"
   , "optparse"
   , "pathy"
   , "psci-support"
   , "toppokki"
+  , "variant"
   , "yaml-next"
   ]
 , packages = ./packages.dhall

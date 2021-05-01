@@ -1,27 +1,34 @@
 module Main where
 
 import Prelude
-import Control.Monad.Except (runExcept)
-import Data.Argonaut (decodeJson, printJsonDecodeError)
-import Data.Either (Either(..))
+import Data.Argonaut (JsonDecodeError, decodeJson)
+import Data.Either (either)
+import Data.Foldable (fold)
 import Data.Maybe (Maybe(..))
 import Data.String (Replacement(..), Pattern(..), replaceAll)
 import Data.Symbol (SProxy(..))
+import Data.List.Types (NonEmptyList)
 import Data.Time.Duration (Milliseconds(..))
 import Data.Traversable (sequence_)
-import Data.Foldable (fold)
 import Data.YAML.Foreign.Decode (parseYAMLToJson)
+import Data.Variant (Variant, inj)
 import Effect (Effect)
+import Control.Monad.Except (withExceptT, except)
+import Control.Monad.Except.Trans (runExceptT, ExceptT, lift, throwError)
+import Control.Monad.Morph (generalize, hoist)
 import Effect.Aff (launchAff_, delay, Aff)
 import Effect.Class.Console (log)
 import Node.Encoding (Encoding(..))
 import Node.FS.Aff (readTextFile)
 import Node.FS.Aff.Mkdirp (mkdirp)
+import Options.Applicative (execParser, str, argument, ParserInfo, Parser, (<**>), info, metavar, fullDesc, progDesc, header, helper)
 import Pathy (Dir, File, Path, Rel, unsafePrintPath, currentDir, dir, parseRelDir, parseRelFile, posixParser, posixPrinter, sandboxAny, (<.>), (</>))
 import Screener.Devices as D
-import Options.Applicative (execParser, str, argument, ParserInfo, Parser, (<**>), info, metavar, fullDesc, progDesc, header, helper)
 import Toppokki as T
+import Exceptions as E
+import Foreign (ForeignError)
 
+-- Configurations
 type Config
   = { project :: String
     , urls :: Array String
@@ -34,35 +41,50 @@ type CaptureConfig
     , url :: T.URL
     }
 
-getFolder :: String -> String -> Either String (Path Rel Dir)
-getFolder project device = case projectDir, deviceDir of
-  Left err, _ -> Left $ err
-  _, Left err -> Left $ err
-  Right a, Right b -> Right $ currentDir </> screenDir </> a </> b
+-- parsing
+getFolder ::
+  forall e m.
+  Monad m =>
+  String ->
+  String ->
+  ExceptT
+    ( Variant
+        ( parseDeviceError :: String
+        , parseProjectError :: String
+        | e
+        )
+    )
+    m
+    (Path Rel Dir)
+getFolder project device = do
+  pDir <- projectDir
+  dDir <- deviceDir
+  pure $ currentDir </> screenDir </> pDir </> dDir
   where
   deviceDir = case parseDir device of
-    Just x -> Right x
-    Nothing -> Left $ "Can't parse device " <> device <> "\n"
+    Just x -> pure x
+    Nothing -> throwError $ inj E._parseDeviceError $ "Can't parse device " <> device <> "\n"
 
   projectDir = case parseDir project of
-    Just x -> Right x
-    Nothing -> Left $ "Can't parse project " <> project <> "\n"
+    Just x -> pure x
+    Nothing -> throwError $ inj E._parseProjectError $ "Can't parse project " <> project <> "\n"
 
   screenDir = dir (SProxy :: SProxy "screenshots")
 
-getFname :: T.URL -> Either String (Path Rel File)
-getFname url = case fname of
-  Left err -> Left $ err
-  Right x -> Right $ x <.> "png"
+  parseDir :: String -> Maybe (Path Rel Dir)
+  parseDir dir = parseRelDir posixParser ("./" <> dir <> "/")
+
+getFname :: forall e m. Monad m => T.URL -> ExceptT (Variant ( parseURLError :: String | e )) m (Path Rel File)
+getFname url = (\x -> x <.> "png") <$> fname
   where
   fname = case parseRelFile posixParser (url2fname url) of
-    Just x -> Right x
-    Nothing -> Left $ "Can't parse url " <> showURL url <> "\n"
+    Just x -> pure x
+    Nothing -> throwError $ inj E._parseURLError $ "Can't parse url " <> showURL url <> "\n"
 
-getViewport :: String -> Either String (Record T.DefaultViewPort)
+getViewport :: forall e m. Monad m => String -> ExceptT (Variant ( getViewportError :: String | e )) m (Record T.DefaultViewPort)
 getViewport device = case D.getDevice device of
-  Just d -> Right d
-  Nothing -> Left $ "Can't find device: " <> device
+  Just d -> pure d
+  Nothing -> throwError $ inj E._getViewportError $ "Can't find device: " <> device
 
 prepareCapture :: Config -> String -> T.URL -> CaptureConfig
 prepareCapture config device url =
@@ -71,19 +93,22 @@ prepareCapture config device url =
   , url: url
   }
 
-parseDir :: String -> Maybe (Path Rel Dir)
-parseDir dir = parseRelDir posixParser ("./" <> dir <> "/")
-
-readConfig :: String -> Aff (Either String Config)
+readConfig ::
+  forall e.
+  String ->
+  ExceptT
+    ( Variant
+        ( parseYAMLError :: NonEmptyList ForeignError
+        , parseJSONError :: JsonDecodeError
+        | e
+        )
+    )
+    Aff
+    Config
 readConfig fpath = do
-  content <- readTextFile UTF8 fpath
-  case runExcept $ parseYAMLToJson content of
-    Left err -> pure $ Left "Could not parse YAML file"
-    Right json ->
-      pure
-        $ case decodeJson json of
-            Left err -> Left $ printJsonDecodeError err
-            Right config -> Right config
+  content <- lift $ readTextFile UTF8 fpath
+  json <- hoist generalize $ withExceptT (inj E._parseYAMLError) (parseYAMLToJson content)
+  withExceptT (inj E._parseJSONError) $ except $ decodeJson json
 
 showURL :: T.URL -> String
 showURL (T.URL x) = show x
@@ -97,30 +122,40 @@ url2fname (T.URL x) = (noSlash >>> noColon >>> noDot) x
 
   noDot = replaceAll (Pattern ".") (Replacement "_")
 
-capture :: T.Page -> CaptureConfig -> Aff Unit
-capture page config = case folderE, fnameE, viewportE of
-  Right folder, Right fname, Right viewport -> do
-    (mkdirp $ getPathD folder) >>= log
-    T.goto config.url page
-    T.setViewport viewport page
-    delay $ Milliseconds 1000.0
-    _ <- T.screenshot { path: getPathF (folder </> fname), fullPage: true } page
-    log $ "screenshot taken for " <> showURL config.url <> " and " <> config.device
-  Left err, _, _ -> log err
-  _, Left err, _ -> log err
-  _, _, Left err -> log err
+capture ::
+  forall e.
+  T.Page ->
+  CaptureConfig ->
+  ExceptT
+    ( Variant
+        ( parseDeviceError :: String
+        , parseProjectError :: String
+        , parseURLError :: String
+        , getViewportError :: String
+        | e
+        )
+    )
+    Aff
+    Unit
+capture page config = do
+  folder <- getFolder config.project config.device
+  viewport <- getViewport config.device
+  fname <- getFname config.url
+  lift
+    $ do
+        log $ "capturing " <> showURL config.url <> " and " <> config.device
+        mkdirp (toStringD folder) >>= log
+        T.goto config.url page
+        T.setViewport viewport page
+        delay $ Milliseconds 1000.0
+        _ <- T.screenshot { path: toStringF (folder </> fname), fullPage: true } page
+        pure unit
   where
-  folderE = getFolder config.project config.device
+  toStringF :: Path Rel File -> String
+  toStringF = sandboxAny >>> unsafePrintPath posixPrinter
 
-  fnameE = getFname config.url
-
-  viewportE = getViewport config.device
-
-  getPathF :: Path Rel File -> String
-  getPathF = sandboxAny >>> unsafePrintPath posixPrinter
-
-  getPathD :: Path Rel Dir -> String
-  getPathD = sandboxAny >>> unsafePrintPath posixPrinter
+  toStringD :: Path Rel Dir -> String
+  toStringD = sandboxAny >>> unsafePrintPath posixPrinter
 
 cli :: ParserInfo String
 cli =
@@ -137,15 +172,17 @@ cli =
 main :: Effect Unit
 main = do
   projectFile <- execParser cli
-  launchAff_ do
-    log "🍝"
-    readConfig projectFile
-      >>= case _ of
-          Left err -> log err
-          Right config -> do
-            browser <- T.launch { executablePath: "chromium" }
-            page <- T.newPage browser
-            let
-              cfgs = prepareCapture config <$> config.devices <*> (T.URL <$> config.urls)
-            sequence_ (capture page <$> cfgs)
-            T.close browser
+  launchAff_
+    $ do
+        log "🍝"
+        browser <- T.launch { executablePath: "chromium" }
+        page <- T.newPage browser
+        E.handleAny
+          $ do
+              config <- readConfig projectFile
+              let
+                cfgs = prepareCapture config <$> config.devices <*> (T.URL <$> config.urls)
+
+                captures = E.handleAny <$> (capture page <$> cfgs)
+              lift $ sequence_ captures
+        T.close browser
